@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 from functools import wraps
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from dotenv import load_dotenv
@@ -38,6 +38,9 @@ def make_aware(dt):
 
 def get_current_time():
     return datetime.now(timezone.utc)
+
+def get_blocked_ports_list() -> str:
+    return ", ".join(str(port) for port in sorted(BLOCKED_PORTS))
 
 # --- DATABASE CLASS ---
 class Database:
@@ -91,6 +94,13 @@ class Database:
         self.keys.update_one({"key": key_str}, {"$set": {"used": True, "used_by": user_id}})
         return True, f"Premium Activated for {duration} Days!"
 
+    def log_attack(self, user_id, ip, port, duration, status):
+        self.attacks.insert_one({
+            "_id": str(uuid.uuid4()), "user_id": user_id, "ip": ip, "port": port,
+            "duration": duration, "status": status, "timestamp": get_current_time()
+        })
+        self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
+
 db = Database()
 
 # --- DECORATORS ---
@@ -102,128 +112,132 @@ def admin_required(func):
         return await func(update, context)
     return wrapper
 
-# --- HANDLERS (VISUALLY ENHANCED) ---
+# --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.create_user(update.effective_user.id, update.effective_user.username)
-    welcome_msg = (
-        "🔥 **WELCOME TO SASTA DEVELOPER STRESSER** 🔥\n\n"
-        "✨ **Status:** Premium Bot\n"
-        "⚡ **Speed:** Ultra Fast\n"
-        "🛡️ **Safety:** 100% Encrypted\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🛠️ **Commands:**\n"
-        "🚀 `/attack <ip> <port> <time>`\n"
-        "🔑 `/redeem <key>`\n"
-        "👤 `/myinfo` - Check Plan Expiry\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "💎 *DM Admin for Keys!*"
+    
+    msg = (
+        "🔥 **SASTA DEVELOPER PREMIUM** 🔥\n\n"
+        "⚡ **User Commands:**\n"
+        "🚀 /attack - Launch Attack\n"
+        "🔑 /redeem - Activate Premium\n"
+        "👤 /myinfo - Check Subscription\n"
+        "📊 /stats - Bot Statistics\n\n"
     )
-    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    
+    if update.effective_user.id in ADMIN_IDS:
+        msg += (
+            "👑 **Admin Panel:**\n"
+            "💎 /genkey - Create Key\n"
+            "👥 /users - Total Users\n"
+            "📡 /running - Active Attacks\n"
+            "🚫 /blockedports - View Filters\n"
+        )
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user or not user.get("approved") or user.get("expires_at") < get_current_time():
+        await update.message.reply_text("⛔ **Subscription Required!**\nUse /redeem to activate.", parse_mode='Markdown')
+        return
+
+    if len(context.args) != 3:
+        await update.message.reply_text("📝 **Usage:** `/attack <ip> <port> <time>`", parse_mode='Markdown')
+        return
+
+    ip, port, duration = context.args[0], int(context.args[1]), int(context.args[2])
+    if port in BLOCKED_PORTS:
+        await update.message.reply_text("🚫 **Port Blacklisted.**", parse_mode='Markdown')
+        return
+
+    status_msg = await update.message.reply_text("🛰️ **Sending Attack Request...**")
+    try:
+        res = requests.post(f"{API_URL}/api/v1/attack", 
+                           json={"ip": ip, "port": port, "duration": duration},
+                           headers={"x-api-key": API_KEY}, timeout=15).json()
+        if res.get("success"):
+            db.log_attack(user["user_id"], ip, port, duration, "success")
+            await status_msg.edit_text(f"✅ **Attack Launched!**\n🎯 `{ip}:{port}`\n⏳ `{duration}s`")
+        else:
+            await status_msg.edit_text(f"❌ **API Error:** {res.get('error')}")
+    except:
+        await status_msg.edit_text("⚠️ **API Offline!**")
 
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ **Usage:** `/redeem SASTA-XXXX`", parse_mode='Markdown')
+        await update.message.reply_text("🔑 Usage: `/redeem SASTA-XXXX`")
         return
     success, msg = db.redeem_key(update.effective_user.id, context.args[0].upper())
-    icon = "✅" if success else "❌"
-    await update.message.reply_text(f"{icon} **{msg}**", parse_mode='Markdown')
+    await update.message.reply_text(f"{'✅' if success else '❌'} **{msg}**", parse_mode='Markdown')
+
+async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    exp = user.get("expires_at")
+    status = "🟢 ACTIVE" if user.get("approved") and exp > get_current_time() else "🔴 EXPIRED"
+    await update.message.reply_text(
+        f"👤 **PROFILE**\nStatus: `{status}`\nExpiry: `{exp.strftime('%Y-%m-%d') if exp else 'N/A'}`\nTotal: `{user.get('total_attacks', 0)}`",
+        parse_mode='Markdown'
+    )
 
 @admin_required
 async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(context.args[0]) if context.args else 30
     key = db.generate_key(days)
-    await update.message.reply_text(
-        f"💎 **NEW PREMIUM KEY CREATED** 💎\n\n"
-        f"🔑 Key: `{key}`\n"
-        f"⏳ Duration: `{days} Days`\n\n"
-        f"Share this key with the customer.", 
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text(f"🔑 **Key Created:** `{key}`\n⏳ **Duration:** `{days} Days`", parse_mode='Markdown')
 
-async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = db.get_user(update.effective_user.id)
-    if not user or not user.get("approved") or user.get("expires_at") < get_current_time():
-        await update.message.reply_text("⛔ **Access Denied!**\nYou don't have an active premium plan.", parse_mode='Markdown')
-        return
+@admin_required
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = db.users.count_documents({})
+    await update.message.reply_text(f"👥 **Total Database Users:** `{count}`", parse_mode='Markdown')
 
-    if len(context.args) != 3:
-        await update.message.reply_text("📝 **Format:** `/attack <ip> <port> <time>`", parse_mode='Markdown')
-        return
+@admin_required
+async def running_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This shows last 5 attacks as 'running' for visual effect
+    recent = db.attacks.find().sort("timestamp", -1).limit(5)
+    text = "📡 **Recent Attacks:**\n"
+    for r in recent:
+        text += f"• `{r['ip']}:{r['port']}` ({r['duration']}s)\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-    ip, port, duration = context.args[0], int(context.args[1]), int(context.args[2])
-    if port in BLOCKED_PORTS:
-        await update.message.reply_text("🚫 **Port Blocked!** Security restriction active.", parse_mode='Markdown')
-        return
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total_attacks = db.attacks.count_documents({"status": "success"})
+    await update.message.reply_text(f"📊 **Total Successful Attacks:** `{total_attacks}`", parse_mode='Markdown')
 
-    status_msg = await update.message.reply_text("🛰️ **Connecting to Server...**")
-    
-    try:
-        res = requests.post(f"{API_URL}/api/v1/attack", 
-                           json={"ip": ip, "port": port, "duration": duration},
-                           headers={"x-api-key": API_KEY}, timeout=15).json()
-        
-        if res.get("success"):
-            db.log_attack(user["user_id"], ip, port, duration, "success")
-            await status_msg.edit_text(
-                f"🚀 **ATTACK LAUNCHED SUCCESSFULLY!**\n\n"
-                f"🎯 **Target:** `{ip}:{port}`\n"
-                f"⏳ **Duration:** `{duration}s`\n"
-                f"💣 **Status:** Sending Packets...",
-                parse_mode='Markdown'
-            )
-        else:
-            await status_msg.edit_text(f"❌ **API Error:** {res.get('error', 'Rejected')}")
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ **Server Busy or Offline!**")
+@admin_required
+async def blocked_ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🚫 **Blocked Ports:**\n`{get_blocked_ports_list()}`", parse_mode='Markdown')
 
-async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = db.get_user(update.effective_user.id)
-    if not user: return
-    
-    exp = user.get("expires_at")
-    is_active = user.get("approved") and (not exp or exp > get_current_time())
-    status_icon = "🟢" if is_active else "🔴"
-    exp_str = exp.strftime('%Y-%m-%d %H:%M') if exp else "LIFETIME"
-    
-    await update.message.reply_text(
-        f"👤 **USER PROFILE**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🆔 ID: `{user['user_id']}`\n"
-        f"⭐ Status: {status_icon} {'PREMIUM' if is_active else 'FREE/EXPIRED'}\n"
-        f"📅 Expiry: `{exp_str}`\n"
-        f"📊 Total Attacks: `{user.get('total_attacks', 0)}`\n"
-        f"━━━━━━━━━━━━━━━",
-        parse_mode='Markdown'
-    )
-
-# --- STARTUP SEQUENCE ---
+# --- MAIN ---
 def main():
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN is missing!")
-        return
-
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # User Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("attack", attack))
     application.add_handler(CommandHandler("redeem", redeem))
-    application.add_handler(CommandHandler("genkey", genkey))
     application.add_handler(CommandHandler("myinfo", myinfo))
+    application.add_handler(CommandHandler("stats", stats_command))
+    
+    # Admin Handlers
+    application.add_handler(CommandHandler("genkey", genkey))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("running", running_command))
+    application.add_handler(CommandHandler("blockedports", blocked_ports_command))
 
     try:
         server_ip = requests.get('https://api.ipify.org', timeout=3).text
     except:
         server_ip = "N/A"
 
-    print("\n" + "★"*20)
-    logger.info("💎 SASTA DEVELOPER PREMIUM BOT INITIALIZED")
+    print("\n" + "="*40)
+    logger.info("💎 SASTA DEVELOPER BOT STARTED")
     logger.info(f"📍 SERVER IP: {server_ip}")
-    logger.info(f"📊 DATABASE: {DATABASE_NAME} - ONLINE")
-    logger.info(f"👑 ADMINS LOADED: {len(ADMIN_IDS)}")
-    logger.info(f"🚫 BLACKLISTED PORTS: {len(BLOCKED_PORTS)}")
-    logger.info("✅ SYSTEM STATUS: OPERATIONAL")
-    print("★"*20 + "\n")
+    logger.info(f"📊 DB: {DATABASE_NAME} - ONLINE")
+    logger.info(f"👑 ADMINS: {ADMIN_IDS}")
+    logger.info("✅ SYSTEM READY")
+    print("="*40 + "\n")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
