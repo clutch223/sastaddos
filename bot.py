@@ -192,15 +192,21 @@ def remove_key(message):
         else: bot.reply_to(message, "❌ Not found.")
     except: bot.reply_to(message, "Usage: `/remove_key <KEY>`")
 
-# --- FIXED REDEEM LOGIC ---
+@bot.message_handler(commands=['clear_keys'])
+def clear_keys_cmd(message):
+    if message.from_user.id != ADMIN_ID: return
+    global keys
+    keys = {}
+    save_db("keys.json", keys)
+    bot.reply_to(message, "🗑️ **ALL KEYS DELETED SUCCESSFULLY.**")
+
+# --- USER COMMANDS ---
+
 @bot.message_handler(commands=['redeem'])
 def redeem(message):
     uid = str(message.from_user.id)
     uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
-    
-    # Ensure user exists in db
-    if uid not in users:
-        users[uid] = {"expiry": 0, "username": uname}
+    if uid not in users: users[uid] = {"expiry": 0, "username": uname}
 
     try:
         parts = message.text.split()
@@ -210,7 +216,6 @@ def redeem(message):
             
         k = parts[1]
         if k in keys and keys[k]['used_by'] is None:
-            # Add time to current expiry
             current_time = time.time()
             if users[uid]['expiry'] < current_time:
                 users[uid]['expiry'] = current_time + keys[k]['duration']
@@ -220,11 +225,11 @@ def redeem(message):
             keys[k]['used_by'] = uname
             save_db("users.json", users)
             save_db("keys.json", keys)
-            bot.reply_to(message, "👑 **VIP ACCESS GRANTED!**\nYour plan has been activated/extended.")
+            bot.reply_to(message, "👑 **VIP ACCESS GRANTED!**\nYour plan has been activated.")
         else:
             bot.reply_to(message, "❌ **Key Invalid or Already Used.**")
-    except Exception as e:
-        bot.reply_to(message, "⚠️ **System Error during redemption.**")
+    except:
+        bot.reply_to(message, "⚠️ System Error.")
 
 @bot.message_handler(commands=['myid', 'plans'])
 def info_hub(message):
@@ -235,5 +240,6 @@ def info_hub(message):
         bot.reply_to(message, f"👤 **ID:** `{uid}`\n📅 **EXPIRY:** `{rem}`")
     else: bot.reply_to(message, "💎 **PLANS:** 1 Day: 100 | 7 Day: 400 | 30 Day: 2000")
 
-print("SASTA DEVELOPER v9.1 REDEEM FIXED...")
+print("SASTA DEVELOPER v9.2 FULLY READY...")
 bot.infinity_polling()
+        
